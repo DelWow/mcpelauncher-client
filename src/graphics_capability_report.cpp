@@ -1,5 +1,6 @@
 #include "graphics_capability_report.h"
 #include "fake_egl.h"
+#include "vulkan_capability_collector.h"
 
 #include <build_info.h>
 #include <mcpelauncher/path_helper.h>
@@ -588,6 +589,7 @@ struct EglLayerObservation {
 
 struct HostEglObservation : EglLayerObservation {
     BackendObservation deviceBackend;
+    VulkanCapabilityObservation vulkan;
     std::string vendor;
     std::string runtimeVersion;
     bool resolverAvailable = false;
@@ -1125,7 +1127,9 @@ HostEglObservation queryHostEgl(GraphicsCapabilityReport::HostProcAddress getHos
     auto eglQueryDisplayAttrib = reinterpret_cast<EglQueryDisplayAttrib>(getHostProcAddress("eglQueryDisplayAttribEXT"));
     auto eglQueryDeviceString = reinterpret_cast<EglQueryDeviceString>(getHostProcAddress("eglQueryDeviceStringEXT"));
     auto eglQueryString = reinterpret_cast<EglQueryString>(getHostProcAddress("eglQueryString"));
-    auto eglGetError = reinterpret_cast<EglGetErrorFunction>(getHostProcAddress("eglGetError"));
+    auto eglQueryDeviceAttribFunction = getHostProcAddress("eglQueryDeviceAttribEXT");
+    auto eglGetErrorFunction = getHostProcAddress("eglGetError");
+    auto eglGetError = reinterpret_cast<EglGetErrorFunction>(eglGetErrorFunction);
 
     if(eglGetCurrentDisplay == nullptr || eglQueryString == nullptr || eglGetError == nullptr) {
         return result;
@@ -1242,6 +1246,11 @@ HostEglObservation queryHostEgl(GraphicsCapabilityReport::HostProcAddress getHos
             eglGetError();
         } else if(auto deviceExtensions = parseEglExtensionSet(deviceExtensionString)) {
             result.deviceBackend = backendFromDeviceExtensions(*deviceExtensions);
+            if(result.deviceBackend.backend && *result.deviceBackend.backend == "vulkan") {
+                result.vulkan = collectAngleVulkanCapabilities(
+                    reinterpret_cast<EglDevice>(deviceAttribute),
+                    eglQueryDeviceAttribFunction, eglGetErrorFunction);
+            }
         }
     }
     return result;
@@ -1833,6 +1842,8 @@ void GraphicsCapabilityReport::recordGraphicsContextCreated(
                        rendererIdentifiesAngle || runtimeIdentifiesAngle;
     auto& angle = impl->document["sections"]["angle"];
     angle["errors"] = json::array();
+    auto& vulkan = impl->document["sections"]["vulkan"];
+    vulkan["errors"] = json::array();
 
     if(!angleActive) {
         angle["data"] = nullptr;
@@ -1840,6 +1851,8 @@ void GraphicsCapabilityReport::recordGraphicsContextCreated(
                                    (glRenderer.empty() || rendererOverrideActive) &&
                                    egl.runtimeVersion.empty() && !egl.deviceQueryAvailable;
         angle["status"] = evidenceUnavailable ? "unavailable" : "not_applicable";
+        vulkan["status"] = evidenceUnavailable ? "unavailable" : "not_applicable";
+        vulkan["data"] = nullptr;
         return;
     }
 
@@ -1894,6 +1907,47 @@ void GraphicsCapabilityReport::recordGraphicsContextCreated(
         });
     } else {
         angle["status"] = "collected";
+    }
+
+    if(selectedBackend && *selectedBackend != "vulkan") {
+        vulkan["status"] = "not_applicable";
+        vulkan["data"] = nullptr;
+    } else if(!selectedBackend) {
+        vulkan["status"] = "unavailable";
+        vulkan["data"] = nullptr;
+    } else if(!egl.vulkan.queryEntryPointAvailable) {
+        vulkan["status"] = "unavailable";
+        vulkan["data"] = nullptr;
+    } else if(!egl.vulkan.bridgeDataAvailable) {
+        vulkan["status"] = "error";
+        vulkan["data"] = nullptr;
+        for(const auto& error : egl.vulkan.errors) {
+            vulkan["errors"].push_back({
+                {"code", error.code},
+                {"message", error.message}
+            });
+        }
+        if(vulkan["errors"].empty()) {
+            vulkan["errors"].push_back({
+                {"code", "vulkan_angle_device_bridge_query_failed"},
+                {"message", "The selected ANGLE Vulkan backend rejected every active device bridge query"}
+            });
+        }
+    } else {
+        vulkan["status"] = egl.vulkan.complete ? "collected" : "partial";
+        vulkan["data"] = std::move(egl.vulkan.data);
+        for(const auto& error : egl.vulkan.errors) {
+            vulkan["errors"].push_back({
+                {"code", error.code},
+                {"message", error.message}
+            });
+        }
+        if(!egl.vulkan.complete && vulkan["errors"].empty()) {
+            vulkan["errors"].push_back({
+                {"code", "vulkan_capability_collection_incomplete"},
+                {"message", "The active ANGLE Vulkan capability contract was incomplete"}
+            });
+        }
     }
 }
 
@@ -2066,6 +2120,11 @@ void GraphicsCapabilityReport::recordGraphicsContextCreationFailed() {
     hostEgl["status"] = "unavailable";
     hostEgl["data"] = nullptr;
     hostEgl["errors"] = json::array();
+
+    auto& vulkan = impl->document["sections"]["vulkan"];
+    vulkan["status"] = "unavailable";
+    vulkan["data"] = nullptr;
+    vulkan["errors"] = json::array();
 
     auto& guestGl = impl->document["sections"]["guest_gl"];
     guestGl["status"] = "unavailable";
