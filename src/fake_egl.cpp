@@ -1,5 +1,6 @@
 #include "fake_egl.h"
 #include "gl_core_patch.h"
+#include "shader_error_patch.h"
 #include "settings.h"
 #include "imgui_ui.h"
 #include <algorithm>
@@ -467,5 +468,20 @@ void FakeEGL::setupGLOverrides() {
             ((void (*)(unsigned int target, int level, int xoffset, int yoffset, int width, int height, unsigned int format, unsigned int type, const void *data))(fake_egl::hostProcAddrFn("glTexSubImage2D")))(target, level, xoffset, yoffset, width, height, format, type, data);
         };
     }
-    GLCorePatch::installGL(fake_egl::hostProcOverrides, fake_egl::eglGetProcAddress);
+    // Install the idempotent GLCore layer first so shader diagnostics remain
+    // outermost and can safely be reasserted during repeated setup.
+    if(GLCorePatch::installGL(fake_egl::hostProcOverrides,
+                              fake_egl::eglGetProcAddress)) {
+        try {
+            ShaderErrorPatch::installGL(fake_egl::hostProcOverrides,
+                                        fake_egl::eglGetProcAddress);
+        } catch(const std::exception& exception) {
+            Log::warn("Shader", "Could not install shader failure logging: %s",
+                      exception.what());
+        } catch(...) {
+            Log::warn("Shader", "Could not install shader failure logging");
+        }
+    } else {
+        Log::warn("Shader", "Shader failure logging deferred because GLCore overrides are incomplete");
+    }
 }

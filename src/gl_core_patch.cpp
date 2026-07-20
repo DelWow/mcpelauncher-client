@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 bool GLCorePatch::enabled = false;
+bool GLCorePatch::glOverridesInstalled = false;
 std::unordered_map<unsigned int, unsigned int> GLCorePatch::vaoMap;
 std::pair<int, unsigned int> GLCorePatch::buffers[2] = {{0x8892, 0}, {0x8893, 0}};
 void (*GLCorePatch::glGenVertexArrays)(int n, unsigned int *arrays);
@@ -43,22 +44,49 @@ void GLCorePatch::install(void *handle) {
     enabled = true;
 }
 
-void GLCorePatch::installGL(std::unordered_map<std::string, void *> &overrides, void *(*resolver)(const char *)) {
+bool GLCorePatch::installGL(std::unordered_map<std::string, void *> &overrides, void *(*resolver)(const char *)) {
     if(!enabled)
-        return;
+        return true;
 
-    glGenVertexArrays = (void (*)(int, unsigned int *))resolver("glGenVertexArrays");
-    glBindVertexArray = (void (*)(unsigned int))resolver("glBindVertexArray");
+    // The override map can be rebuilt, but these process-lifetime originals
+    // must not capture GLCore's own wrappers on a later setup pass.
+    if(!glOverridesInstalled) {
+        if(resolver == nullptr) {
+            Log::warn("GLCOREPATCH", "Could not install GLCore overrides: resolver unavailable");
+            return false;
+        }
 
-    glShaderSource_orig = (void (*)(unsigned int, unsigned int, const char **, int *))resolver("glShaderSource");
-    glLinkProgram_orig = (void (*)(unsigned int))resolver("glLinkProgram");
-    glUseProgram_orig = (void (*)(unsigned int))resolver("glUseProgram");
-    glBindBuffer_orig = (void (*)(int, unsigned int))resolver("glBindBuffer");
+        auto genVertexArrays = (void (*)(int, unsigned int *))resolver("glGenVertexArrays");
+        auto bindVertexArray = (void (*)(unsigned int))resolver("glBindVertexArray");
+        auto shaderSource = (void (*)(unsigned int, unsigned int, const char **, int *))resolver("glShaderSource");
+        auto linkProgram = (void (*)(unsigned int))resolver("glLinkProgram");
+        auto useProgram = (void (*)(unsigned int))resolver("glUseProgram");
+        auto bindBuffer = (void (*)(int, unsigned int))resolver("glBindBuffer");
+        if(genVertexArrays == nullptr || bindVertexArray == nullptr ||
+           shaderSource == nullptr || linkProgram == nullptr ||
+           useProgram == nullptr || bindBuffer == nullptr ||
+           shaderSource == &GLCorePatch::glShaderSource ||
+           linkProgram == &GLCorePatch::glLinkProgram ||
+           useProgram == &GLCorePatch::glUseProgram ||
+            bindBuffer == &GLCorePatch::glBindBuffer) {
+            Log::warn("GLCOREPATCH", "Could not install GLCore overrides: required entry point unavailable or recursive");
+            return false;
+        }
+
+        glGenVertexArrays = genVertexArrays;
+        glBindVertexArray = bindVertexArray;
+        glShaderSource_orig = shaderSource;
+        glLinkProgram_orig = linkProgram;
+        glUseProgram_orig = useProgram;
+        glBindBuffer_orig = bindBuffer;
+        glOverridesInstalled = true;
+    }
 
     overrides["glShaderSource"] = (void *)glShaderSource;
     overrides["glLinkProgram"] = (void *)glLinkProgram;
     overrides["glUseProgram"] = (void *)glUseProgram;
     overrides["glBindBuffer"] = (void *)glBindBuffer;
+    return true;
 }
 
 void GLCorePatch::glShaderSource(unsigned int shader, unsigned int count, const char **string, int *length) {

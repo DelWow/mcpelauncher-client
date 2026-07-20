@@ -7,6 +7,7 @@
 class GLCorePatch {
 private:
     static bool enabled;
+    static bool glOverridesInstalled;
     static std::unordered_map<unsigned int, unsigned int> vaoMap;
     static std::pair<int, unsigned int> buffers[2];
 
@@ -28,7 +29,9 @@ private:
 public:
     static void install(void *handle);
 
-    static void installGL(std::unordered_map<std::string, void *> &overrides, void *(*resolver)(const char *));
+    // Returns false only when GLCore is enabled but its complete layer could
+    // not be published. Callers must not install dependent wrappers then.
+    static bool installGL(std::unordered_map<std::string, void *> &overrides, void *(*resolver)(const char *));
 
     static bool mustUseDesktopGL();
 };
