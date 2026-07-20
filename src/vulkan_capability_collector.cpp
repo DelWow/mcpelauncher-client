@@ -221,6 +221,14 @@ json extensionRecordsToJson(const std::vector<ExtensionRecord>& extensions) {
     return result;
 }
 
+bool extensionSetContains(const std::vector<ExtensionRecord>& extensions,
+                          const char* name) {
+    return std::any_of(extensions.begin(), extensions.end(),
+                       [name](const auto& extension) {
+                           return extension.name == name;
+                       });
+}
+
 std::optional<std::vector<ExtensionRecord>> enumerateInstanceExtensions(
     PFN_vkEnumerateInstanceExtensionProperties enumerate) {
     std::uint32_t count = 0;
@@ -404,6 +412,14 @@ bool negotiatedVersionIsSupported(std::uint32_t negotiated, std::uint32_t suppor
     constexpr std::uint32_t VERSION_WITHOUT_VARIANT_MASK = (1u << 29u) - 1u;
     return (negotiated & VERSION_WITHOUT_VARIANT_MASK) <=
            (supported & VERSION_WITHOUT_VARIANT_MASK);
+}
+
+bool standardApiVersionAtLeast(std::uint32_t version, std::uint32_t major,
+                               std::uint32_t minor) {
+    return VK_API_VERSION_VARIANT(version) == 0 &&
+        (VK_API_VERSION_MAJOR(version) > major ||
+         (VK_API_VERSION_MAJOR(version) == major &&
+          VK_API_VERSION_MINOR(version) >= minor));
 }
 
 json encodeQueueFlags(VkQueueFlags flags) {
@@ -726,6 +742,8 @@ VulkanCapabilityObservation collectAngleVulkanCapabilities(
     PFN_vkEnumerateInstanceVersion enumerateInstanceVersion = nullptr;
     PFN_vkEnumerateInstanceExtensionProperties enumerateInstanceExtensionProperties = nullptr;
     PFN_vkGetPhysicalDeviceProperties getPhysicalDeviceProperties = nullptr;
+    PFN_vkGetPhysicalDeviceProperties2 getPhysicalDeviceProperties2Core = nullptr;
+    PFN_vkGetPhysicalDeviceProperties2 getPhysicalDeviceProperties2Khr = nullptr;
     PFN_vkEnumerateDeviceExtensionProperties enumerateDeviceExtensionProperties = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties getQueueFamilyProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties getMemoryProperties = nullptr;
@@ -741,6 +759,14 @@ VulkanCapabilityObservation collectAngleVulkanCapabilities(
         if(instance != VK_NULL_HANDLE) {
             getPhysicalDeviceProperties = resolveVulkanFunction<PFN_vkGetPhysicalDeviceProperties>(
                 getInstanceProcAddress, instance, "vkGetPhysicalDeviceProperties");
+            getPhysicalDeviceProperties2Core =
+                resolveVulkanFunction<PFN_vkGetPhysicalDeviceProperties2>(
+                    getInstanceProcAddress, instance,
+                    "vkGetPhysicalDeviceProperties2");
+            getPhysicalDeviceProperties2Khr =
+                resolveVulkanFunction<PFN_vkGetPhysicalDeviceProperties2>(
+                    getInstanceProcAddress, instance,
+                    "vkGetPhysicalDeviceProperties2KHR");
             enumerateDeviceExtensionProperties =
                 resolveVulkanFunction<PFN_vkEnumerateDeviceExtensionProperties>(
                     getInstanceProcAddress, instance,
@@ -837,24 +863,76 @@ VulkanCapabilityObservation collectAngleVulkanCapabilities(
                  "The Vulkan instance extension query entry point was unavailable");
     }
 
-    if(physicalDevice != VK_NULL_HANDLE && enumerateDeviceExtensionProperties != nullptr &&
-       enabledDeviceExtensions) {
-        auto available = enumerateDeviceExtensions(enumerateDeviceExtensionProperties,
-                                                   physicalDevice);
-        if(available && enabledExtensionsAreAvailable(*enabledDeviceExtensions, *available)) {
-            observation.data["device_extensions"] = {
-                {"enabled", *enabledDeviceExtensions},
-                {"available", extensionRecordsToJson(*available)}};
-        } else if(!available) {
+    std::optional<std::vector<ExtensionRecord>> availableDeviceExtensions;
+    if(physicalDevice != VK_NULL_HANDLE && enumerateDeviceExtensionProperties != nullptr) {
+        availableDeviceExtensions = enumerateDeviceExtensions(
+            enumerateDeviceExtensionProperties, physicalDevice);
+        if(!availableDeviceExtensions) {
             addError(observation, "vulkan_available_device_extensions_query_failed",
                      "The available Vulkan device extension set could not be collected within bounds");
-        } else {
+        } else if(enabledDeviceExtensions &&
+                  enabledExtensionsAreAvailable(*enabledDeviceExtensions,
+                                                *availableDeviceExtensions)) {
+            observation.data["device_extensions"] = {
+                {"enabled", *enabledDeviceExtensions},
+                {"available", extensionRecordsToJson(*availableDeviceExtensions)}};
+        } else if(enabledDeviceExtensions) {
             addError(observation, "vulkan_enabled_device_extension_unavailable",
                      "ANGLE enabled a Vulkan device extension not present in the available set");
         }
     } else if(enumerateDeviceExtensionProperties == nullptr) {
         addError(observation, "vulkan_device_extension_query_entry_point_unavailable",
                  "The Vulkan device extension query entry point was unavailable");
+    }
+
+    bool activeDriverIsMoltenVk = false;
+    bool serializedMoltenVkEvidenceAvailable =
+        !observation.data["physical_device"].is_null() &&
+        !observation.data["versions"].is_null() &&
+        !observation.data["instance_extensions"].is_null() &&
+        !observation.data["device_extensions"].is_null();
+    bool coreProperties2Supported = negotiatedVersion && properties &&
+        standardApiVersionAtLeast(*negotiatedVersion, 1, 1) &&
+        standardApiVersionAtLeast(properties->apiVersion, 1, 1);
+    bool khrProperties2Enabled = enabledInstanceExtensions &&
+        std::binary_search(enabledInstanceExtensions->begin(),
+                           enabledInstanceExtensions->end(),
+                           "VK_KHR_get_physical_device_properties2");
+    PFN_vkGetPhysicalDeviceProperties2 getPhysicalDeviceProperties2 = nullptr;
+    if(coreProperties2Supported && getPhysicalDeviceProperties2Core != nullptr) {
+        getPhysicalDeviceProperties2 = getPhysicalDeviceProperties2Core;
+    } else if(khrProperties2Enabled && getPhysicalDeviceProperties2Khr != nullptr) {
+        getPhysicalDeviceProperties2 = getPhysicalDeviceProperties2Khr;
+    }
+    bool coreDriverPropertiesSupported = negotiatedVersion && properties &&
+        standardApiVersionAtLeast(*negotiatedVersion, 1, 2) &&
+        standardApiVersionAtLeast(properties->apiVersion, 1, 2);
+    bool extensionDriverPropertiesSupported =
+        getPhysicalDeviceProperties2 != nullptr && availableDeviceExtensions &&
+        extensionSetContains(*availableDeviceExtensions,
+                             "VK_KHR_driver_properties");
+    bool driverPropertiesSupported = coreDriverPropertiesSupported ||
+        extensionDriverPropertiesSupported;
+    if(serializedMoltenVkEvidenceAvailable &&
+       physicalDevice != VK_NULL_HANDLE && properties &&
+       getPhysicalDeviceProperties2 != nullptr && driverPropertiesSupported) {
+        VkPhysicalDeviceDriverProperties driverProperties{};
+        driverProperties.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+        VkPhysicalDeviceProperties2 properties2{};
+        properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        properties2.pNext = &driverProperties;
+        getPhysicalDeviceProperties2(physicalDevice, &properties2);
+        bool corePropertiesMatch =
+            properties2.properties.apiVersion == properties->apiVersion &&
+            properties2.properties.driverVersion == properties->driverVersion &&
+            properties2.properties.vendorID == properties->vendorID &&
+            properties2.properties.deviceID == properties->deviceID &&
+            properties2.properties.deviceType == properties->deviceType &&
+            std::strncmp(properties2.properties.deviceName, properties->deviceName,
+                         VK_MAX_PHYSICAL_DEVICE_NAME_SIZE) == 0;
+        activeDriverIsMoltenVk = corePropertiesMatch &&
+            driverProperties.driverID == VK_DRIVER_ID_MOLTENVK;
     }
 
     if(physicalDevice != VK_NULL_HANDLE && getQueueFamilyProperties != nullptr &&
@@ -990,6 +1068,15 @@ VulkanCapabilityObservation collectAngleVulkanCapabilities(
     } else if(getFormatProperties == nullptr) {
         addError(observation, "vulkan_format_query_entry_point_unavailable",
                  "The Vulkan format-property query entry point was unavailable");
+    }
+
+    if(serializedMoltenVkEvidenceAvailable && instance != VK_NULL_HANDLE &&
+       getInstanceProcAddress != nullptr && properties) {
+        observation.moltenVk = collectMoltenVkCapabilities(
+            reinterpret_cast<void*>(instance),
+            reinterpret_cast<MoltenVkHostFunction>(getInstanceProcAddress),
+            properties->driverVersion, activeDriverIsMoltenVk,
+            enabledInstanceExtensions ? &*enabledInstanceExtensions : nullptr);
     }
 
     observation.complete = observation.errors.empty() &&

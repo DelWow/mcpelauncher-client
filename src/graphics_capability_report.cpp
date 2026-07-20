@@ -1844,6 +1844,8 @@ void GraphicsCapabilityReport::recordGraphicsContextCreated(
     angle["errors"] = json::array();
     auto& vulkan = impl->document["sections"]["vulkan"];
     vulkan["errors"] = json::array();
+    auto& moltenVk = impl->document["sections"]["moltenvk"];
+    moltenVk["errors"] = json::array();
 
     if(!angleActive) {
         angle["data"] = nullptr;
@@ -1853,6 +1855,8 @@ void GraphicsCapabilityReport::recordGraphicsContextCreated(
         angle["status"] = evidenceUnavailable ? "unavailable" : "not_applicable";
         vulkan["status"] = evidenceUnavailable ? "unavailable" : "not_applicable";
         vulkan["data"] = nullptr;
+        moltenVk["status"] = evidenceUnavailable ? "unavailable" : "not_applicable";
+        moltenVk["data"] = nullptr;
         return;
     }
 
@@ -1946,6 +1950,48 @@ void GraphicsCapabilityReport::recordGraphicsContextCreated(
             vulkan["errors"].push_back({
                 {"code", "vulkan_capability_collection_incomplete"},
                 {"message", "The active ANGLE Vulkan capability contract was incomplete"}
+            });
+        }
+    }
+
+    const auto& moltenVkObservation = egl.vulkan.moltenVk;
+    if(selectedBackend && *selectedBackend != "vulkan") {
+        moltenVk["status"] = "not_applicable";
+        moltenVk["data"] = nullptr;
+    } else if(!selectedBackend || !egl.vulkan.queryEntryPointAvailable) {
+        moltenVk["status"] = "unavailable";
+        moltenVk["data"] = nullptr;
+    } else if(!moltenVkObservation.implementationDetected) {
+        moltenVk["status"] = "unavailable";
+        moltenVk["data"] = nullptr;
+    } else if(moltenVkObservation.data.is_null()) {
+        moltenVk["status"] = "error";
+        moltenVk["data"] = nullptr;
+        for(const auto& error : moltenVkObservation.errors) {
+            moltenVk["errors"].push_back({
+                {"code", error.code},
+                {"message", error.message}
+            });
+        }
+        if(moltenVk["errors"].empty()) {
+            moltenVk["errors"].push_back({
+                {"code", "moltenvk_private_api_query_failed"},
+                {"message", "The active MoltenVK implementation did not return report data"}
+            });
+        }
+    } else {
+        moltenVk["status"] = moltenVkObservation.complete ? "collected" : "partial";
+        moltenVk["data"] = moltenVkObservation.data;
+        for(const auto& error : moltenVkObservation.errors) {
+            moltenVk["errors"].push_back({
+                {"code", error.code},
+                {"message", error.message}
+            });
+        }
+        if(!moltenVkObservation.complete && moltenVk["errors"].empty()) {
+            moltenVk["errors"].push_back({
+                {"code", "moltenvk_capability_collection_incomplete"},
+                {"message", "The active MoltenVK configuration contract was incomplete"}
             });
         }
     }
@@ -2125,6 +2171,11 @@ void GraphicsCapabilityReport::recordGraphicsContextCreationFailed() {
     vulkan["status"] = "unavailable";
     vulkan["data"] = nullptr;
     vulkan["errors"] = json::array();
+
+    auto& moltenVk = impl->document["sections"]["moltenvk"];
+    moltenVk["status"] = "unavailable";
+    moltenVk["data"] = nullptr;
+    moltenVk["errors"] = json::array();
 
     auto& guestGl = impl->document["sections"]["guest_gl"];
     guestGl["status"] = "unavailable";

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "moltenvk_capability_collector.h"
+
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
@@ -13,6 +15,7 @@ struct VulkanCapabilityError {
 struct VulkanCapabilityObservation {
     nlohmann::json data = nullptr;
     std::vector<VulkanCapabilityError> errors;
+    MoltenVkCapabilityObservation moltenVk;
     bool queryEntryPointAvailable = false;
     bool bridgeDataAvailable = false;
     bool complete = false;
